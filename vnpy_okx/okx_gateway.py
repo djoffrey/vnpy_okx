@@ -18,6 +18,7 @@ from vnpy_evo.trader.constant import (
     Offset,
     OrderType,
     Product,
+    OptionType,
     Status
 )
 from vnpy_evo.trader.gateway import BaseGateway
@@ -66,14 +67,16 @@ STATUS_OKX2VT: dict[str, Status] = {
     "partially_filled": Status.PARTTRADED,
     "filled": Status.ALLTRADED,
     "canceled": Status.CANCELLED,
-    "mmp_canceled": Status.CANCELLED
+    "mmp_canceled": Status.CANCELLED,
+    "market": Status.ALLTRADED
 }
 
 # Order type map
 ORDERTYPE_OKX2VT: dict[str, OrderType] = {
     "limit": OrderType.LIMIT,
     "fok": OrderType.FOK,
-    "ioc": OrderType.FAK
+    "ioc": OrderType.FAK,
+    "market": OrderType.MARKET
 }
 ORDERTYPE_VT2OKX: dict[OrderType, str] = {v: k for k, v in ORDERTYPE_OKX2VT.items()}
 
@@ -91,13 +94,20 @@ INTERVAL_VT2OKX: dict[Interval, str] = {
     Interval.DAILY: "1D",
 }
 
-# Product type map
+# 产品类型映射
 PRODUCT_OKX2VT: dict[str, Product] = {
     "SWAP": Product.FUTURES,
     "SPOT": Product.SPOT,
-    "FUTURES": Product.FUTURES
+    "FUTURES": Product.FUTURES,
+    #"OPTION": Product.OPTION
 }
 PRODUCT_VT2OKX: dict[Product, str] = {v: k for k, v in PRODUCT_OKX2VT.items()}
+
+# 期权类型映射
+OPTIONTYPE_OKXO2VT: dict[str, OptionType] = {
+    "C": OptionType.CALL,
+    "P": OptionType.PUT
+}
 
 # Global dict for contract data
 symbol_contract_map: dict[str, ContractData] = {}
@@ -140,6 +150,12 @@ class OkxGateway(BaseGateway):
         self.ws_private_api: OkxWebsocketPrivateApi = OkxWebsocketPrivateApi(self)
 
         self.orders: dict[str, OrderData] = {}
+        
+        self.key = None
+        self.secret = None
+        self.passphrase = None
+        self.proxy_host = None
+        self.proxy_port = None
 
     def connect(self, setting: dict) -> None:
         """Start server connections"""
@@ -149,6 +165,12 @@ class OkxGateway(BaseGateway):
         server: str = setting["Server"]
         proxy_host: str = setting["Proxy Host"]
         proxy_port: str = setting["Proxy Port"]
+
+        self.key = key
+        self.secret = secret
+        self.passphrase = passphrase
+        self.proxy_host = proxy_host
+        self.proxy_port = proxy_port
 
         if proxy_port.isdigit():
             proxy_port = int(proxy_port)
@@ -298,6 +320,8 @@ class OkxRestApi(RestClient):
         self.query_time()
         self.query_order()
         self.query_contract()
+        #self.query_instruments()
+
 
     def query_time(self) -> None:
         """Query server time"""
@@ -324,6 +348,67 @@ class OkxRestApi(RestClient):
                 callback=self.on_query_contract,
                 params={"instType": inst_type}
             )
+
+    def query_instruments(self, parket: dict, request: Request) -> None:
+        """初始查询类别"""
+        instTypes = ["SPOT", "MARGIN", "SWAP", "FUTURES"]
+        for instType in instTypes:
+            params = {"instType": instType}
+            self.add_request(
+                "GET",
+                "/api/v5/public/instruments",
+                params=params,
+                callback = self.on_query_instruments
+            )
+
+    def on_query_instruments(self, packet: dict, request: Request) -> None:
+        """初始查询类别回报"""
+        code = int(packet["code"])
+        if code != 0:
+            msg = packet["msg"]
+            self.gateway.write_log(msg)
+            return
+        data = packet["data"]
+        for d in data:
+            # 提取信息生成合约对象
+            symbol: str = d["instId"]
+            product: Product = PRODUCT_OKX2VT[d["instType"]]
+            net_position: bool = True
+            if product == Product.SPOT:
+                size: float = 1
+            else:
+                size: float = float(d["ctMult"])
+
+            contract: ContractData = ContractData(
+                symbol=symbol,
+                exchange=Exchange.OKX,
+                name=symbol,
+                product=product,
+                size=size,
+                pricetick=float(d["tickSz"]),
+                min_volume=float(d["minSz"]),
+                history_data=True,
+                net_position=net_position,
+                gateway_name=self.gateway_name,
+            )
+
+            # 处理期权相关信息
+            if product == Product.OPTION:
+                contract.option_strike = float(d["stk"])
+                contract.option_type = OPTIONTYPE_OKXO2VT[d["optType"]]
+                contract.option_expiry = datetime.fromtimestamp(int(d["expTime"]) / 1000)
+                contract.option_portfolio = d["uly"]
+                contract.option_index = d["stk"]
+                contract.option_underlying = "_".join([
+                    contract.option_portfolio,
+                    contract.option_expiry.strftime("%Y%m%d")
+                ])
+
+            # 缓存合约信息并推送
+            symbol_contract_map[contract.symbol] = contract
+            self.gateway.on_contract(contract)
+
+        self.gateway.write_log(f"{self.gateway_name}: {d['instType']}合约信息查询成功")
 
     def on_query_time(self, packet: dict, request: Request) -> None:
         """Callback of server time query"""
@@ -757,15 +842,28 @@ class OkxWebsocketPrivateApi(WebsocketClient):
             symbol: str = d["instId"]
             pos: int = float(d["pos"])
             price: float = get_float_value(d, "avgPx")
+            liqPrice: float = get_float_value(d, "liqPx")
             pnl: float = get_float_value(d, "upl")
+            pnlRatio: float = get_float_value(d, "uplRatio")
+            posSide: str = d["posSide"]
+            lever: int = float(d["lever"]) if d["lever"] != "" else 0
+            if posSide == 'long':
+                side = Direction.LONG
+            elif posSide == 'short':
+                side = Direction.SHORT
+            else:
+                side = Direction.NET
 
             position: PositionData = PositionData(
                 symbol=symbol,
                 exchange=Exchange.OKX,
-                direction=Direction.NET,
+                direction=side,
                 volume=pos,
                 price=price,
+                liqPrice=liqPrice,
                 pnl=pnl,
+                pnlRatio=pnlRatio,
+                lever=lever,
                 gateway_name=self.gateway_name,
             )
             self.gateway.on_position(position)
