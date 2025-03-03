@@ -1054,6 +1054,9 @@ def parse_order_data(data: dict, gateway_name: str) -> OrderData:
     else:
         order_id: str = data["ordId"]
 
+    px = data["px"] if data["px"] != "" else data["fillPx"]
+    if px == "":
+        px = 0
     order: OrderData = OrderData(
         symbol=data["instId"],
         exchange=Exchange.OKX,
